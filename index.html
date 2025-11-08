@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Charge Link - Find or Share an EV Charger Anywhere</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configure Tailwind to use standard Inter font -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        
+        /* Custom scrollbar for minimalist look, using a standard emerald hex color */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(5, 150, 105, 0.4); /* Equivalent to emerald-600 translucent */
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #059669; /* emerald-600 */
+        }
+        
+        /* Subtle fade effect for page transitions */
+        .page-transition {
+            transition: opacity 0.3s ease-in-out;
+        }
+        
+        /* Custom style to replicate the original light-green image background */
+        .hero-background-fix {
+            background-color: #f0fff0; /* Very light green (Tailwind bg-emerald-50) */
+            border: 1px solid #c6f6d5; /* Slightly darker green border */
+        }
+    </style>
+    
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, getDoc, getDocs, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment (MUST be used)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db = null;
+        let auth = null;
+        let currentUserId = null;
+        let isAuthReady = false;
+
+        // Make functions globally accessible
+        window.submitCharger = submitCharger;
+        window.loadHostDashboard = loadHostDashboard;
+        window.loadChargerListings = loadChargerListings;
+        
+        setLogLevel('Debug');
+
+        async function setupAuthAndFirestore() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. Initial Sign In
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 2. Auth State Listener
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        isAuthReady = true;
+                        
+                        // Update UI with User ID (FIXED to show full ID)
+                        const userIdEl = document.getElementById('current-user-id');
+                        if (userIdEl) userIdEl.textContent = `User ID: ${currentUserId}`;
+
+                        console.log("Firebase initialized and user signed in:", currentUserId);
+                        
+                        // If we are already on a dynamic page, load data
+                        if (currentPageId === 'find-page') {
+                            loadChargerListings();
+                        } else if (currentPageId === 'share-page') {
+                            loadHostDashboard();
+                        }
+                    } else {
+                        // Not authenticated - fall back to anonymous sign-in if needed, though initial sign-in handles this
+                        console.log("User signed out or failed to authenticate.");
+                        isAuthReady = true; 
+                    }
+                });
+
+            } catch (error) {
+                console.error("Error setting up Firebase:", error);
+                isAuthReady = true;
+            }
+        }
+        
+        // --- Firestore Data Loading Functions ---
+
+        /** Fetches and updates host stats in real-time. */
+        function loadHostDashboard() {
+            // CRITICAL FIX: Ensure DB is initialized before attempting queries
+            if (!isAuthReady || !currentUserId || !db) return;
+            console.log("Attempting to load Host Dashboard for user:", currentUserId);
+
+
+            const hostDocRef = doc(db, 'artifacts', appId, 'users', currentUserId, 'hostData', 'stats');
+
+            // Set up initial data if none exists and start listening
+            onSnapshot(hostDocRef, (docSnap) => {
+                const earningsEl = document.getElementById('host-earnings');
+                const bookingsEl = document.getElementById('host-bookings');
+                const ratingEl = document.getElementById('host-rating');
+                
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    earningsEl.textContent = `₹${(data.totalEarnings || 0).toLocaleString('en-IN')}`;
+                    bookingsEl.textContent = `${data.upcomingBookings || 0} Sessions`;
+                    ratingEl.textContent = `★ ${data.averageRating?.toFixed(1) || 'N/A'}`;
+                } else {
+                    // Initialize with zero values if document doesn't exist
+                    setDoc(hostDocRef, {
+                        totalEarnings: 0,
+                        upcomingBookings: 0,
+                        averageRating: 0.0
+                    }, { merge: true }).catch(e => console.error("Error setting initial host stats:", e));
+
+                    earningsEl.textContent = '₹0';
+                    bookingsEl.textContent = '0 Sessions';
+                    ratingEl.textContent = '★ N/A';
+                }
+            }, (error) => {
+                console.error("Error loading host dashboard:", error);
+            });
+        }
+
+        /** Fetches and renders public charger listings in real-time. */
+        function loadChargerListings() {
+            const listContainer = document.getElementById('charger-list');
+            console.log("loadChargerListings called. isAuthReady:", isAuthReady, "db:", !!db);
+
+
+            // CRITICAL FIX: Ensure DB is initialized before attempting queries
+            if (!isAuthReady || !db) {
+                if (listContainer) {
+                    listContainer.innerHTML = '<p class="text-center text-gray-500 p-8 bg-gray-50 rounded-xl">Establishing secure connection...</p>';
+                }
+                return;
+            }
+            console.log("Starting real-time listener for public chargers...");
+
+
+            const chargersColRef = collection(db, 'artifacts', appId, 'public', 'data', 'chargers');
+            
+            onSnapshot(chargersColRef, (snapshot) => {
+                listContainer.innerHTML = ''; // Clear existing list
+                console.log(`Received ${snapshot.size} charger listings.`);
+
+                
+                if (snapshot.empty) {
+                    // Updated message for clarity
+                    listContainer.innerHTML = '<p class="text-center text-gray-500 p-8 bg-gray-50 rounded-xl">No chargers listed yet. Try sharing a charger on the "Share Your Charger" page to see listings appear here!</p>';
+                    return;
+                }
+
+                snapshot.forEach((doc) => {
+                    const charger = doc.data();
+                    const card = createChargerCard(charger, doc.id);
+                    listContainer.appendChild(card);
+                });
+
+            }, (error) => {
+                console.error("Error loading charger listings:", error);
+                listContainer.innerHTML = `<p class="text-center text-red-500 p-8 bg-gray-50 rounded-xl">Error loading listings. Check console for details.</p>`;
+            });
+        }
+        
+        /** Generates the HTML card for a single charger listing. */
+        function createChargerCard(charger, docId) {
+            const div = document.createElement('div');
+            div.className = 'charger-card p-4 bg-white rounded-xl shadow-lg border-l-4 border-emerald-600 hover:shadow-xl transition duration-200';
+            div.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <div>
+                        <h3 class="text-xl font-bold">${charger.address || 'Unknown Location'} (${charger.powerRating}kW)</h3>
+                        <p class="text-sm text-gray-500">${charger.chargerType} Plug | Host: ${charger.hostId.substring(0, 8)}</p>
+                        <p class="mt-1 text-lg font-semibold text-blue-600">★ ${charger.rating?.toFixed(1) || 'N/A'} (${charger.reviewCount || 0} reviews)</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-3xl font-extrabold text-emerald-600 leading-none">₹${charger.pricePerHour}</p>
+                        <p class="text-sm text-gray-500">/ hr</p>
+                    </div>
+                </div>
+                <button onclick="mockBook('${charger.hostId}')" class="mt-4 w-full py-2 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700 transition">
+                    Book Now
+                </button>
+            `;
+            return div;
+        }
+
+
+        // --- Firestore Data Submission Functions ---
+
+        /** Handles form submission for a new charger listing. */
+        async function submitCharger() {
+            // CRITICAL FIX: Ensure DB is initialized before attempting submission
+            if (!isAuthReady || !currentUserId || !db) {
+                showModal('Authentication Error', 'Please wait for authentication/database connection to complete before listing a charger.');
+                return;
+            }
+
+            const address = document.getElementById('charger-address').value.trim();
+            const type = document.getElementById('charger-type').value;
+            const powerRating = parseFloat(document.getElementById('charger-power').value);
+            const instructions = document.getElementById('charger-instructions').value.trim();
+            const pricePerHour = parseInt(document.getElementById('charger-price').value);
+
+            if (!address || type === 'Select Charger Type' || isNaN(powerRating) || isNaN(pricePerHour) || pricePerHour <= 0) {
+                showModal('Validation Error', 'Please fill in all required charger details (Address, Type, Power, and Price).');
+                return;
+            }
+
+            const newCharger = {
+                hostId: currentUserId,
+                address: address,
+                chargerType: type,
+                powerRating: powerRating,
+                accessInstructions: instructions,
+                pricePerHour: pricePerHour,
+                isAvailable: true,
+                rating: 5.0, // Default rating
+                reviewCount: 0,
+                createdAt: new Date().toISOString()
+            };
+
+            try {
+                const chargersColRef = collection(db, 'artifacts', appId, 'public', 'data', 'chargers');
+                const docRef = await addDoc(chargersColRef, newCharger);
+                
+                // Clear form
+                document.getElementById('charger-form').reset();
+                showModal('Listing Success', `Your charger listing at ${address} has been published! Document ID: ${docRef.id}`);
+            } catch (error) {
+                console.error("Error submitting charger listing:", error);
+                showModal('Submission Failed', `There was an error listing your charger. Please try again. Error: ${error.message}`);
+            }
+        }
+
+        // Run setup on load
+        window.addEventListener('load', setupAuthAndFirestore);
+    </script>
+</head>
+<body class="bg-white font-sans text-gray-800 min-h-screen flex flex-col">
+
+    <!-- Custom Modal for Notifications (instead of alert) -->
+    <div id="modal-container" class="fixed inset-0 bg-gray-800 bg-opacity-70 z-50 hidden items-center justify-center p-4">
+        <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full transform transition-all duration-300 scale-95 opacity-0" id="modal-box">
+            <h3 id="modal-title" class="text-xl font-bold mb-3 text-emerald-600"></h3>
+            <p id="modal-message" class="text-gray-700"></p>
+            <div class="mt-5 text-right">
+                <button onclick="closeModal()" class="px-5 py-2 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700 transition duration-150">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 1. Navigation Header -->
+    <header class="sticky top-0 z-40 bg-white shadow-sm">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <!-- Logo -->
+            <div class="text-2xl font-extrabold text-gray-800 cursor-pointer" onclick="showPage('home')">
+                ⚡ Charge Link
+            </div>
+            
+            <!-- Desktop Navigation and Auth -->
+            <nav class="hidden md:flex items-center space-x-6">
+                <button class="text-gray-600 hover:text-emerald-600 transition" onclick="showPage('find')">Find a Charger</button>
+                <button class="text-gray-600 hover:text-emerald-600 transition" onclick="showPage('share')">Share Your Charger</button>
+                <span id="current-user-id" class="text-sm text-gray-500">Connecting...</span>
+            </nav>
+
+            <!-- Mobile Menu Button (omitted simple prototype) -->
+            <div class="md:hidden">
+                <button class="text-gray-600 text-3xl">☰</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-grow">
+        <div class="max-w-7xl mx-auto">
+            <!-- 2. Page Containers -->
+
+            <!-- HOME PAGE -->
+            <section id="home-page" class="page-transition p-4 md:p-10 lg:p-16">
+                <!-- Hero Section - FIX: Replaced background image with solid color + custom CSS class -->
+                <div class="text-center py-16 md:py-24 lg:py-32 rounded-xl shadow-inner mb-20 hero-background-fix">
+                    <h1 class="text-4xl sm:text-5xl lg:text-7xl font-extrabold text-white leading-tight drop-shadow-lg p-3 bg-gray-800 bg-opacity-40 inline-block rounded-xl">
+                        Find or Share an EV Charger Anywhere.
+                    </h1>
+                    <p class="mt-4 text-xl text-gray-800 max-w-3xl mx-auto font-medium drop-shadow-sm">
+                        Charge Link connects EV owners to private, affordable charging spots, turning unused power into community convenience.
+                    </p>
+                    
+                    <!-- CTAs -->
+                    <div class="mt-10 flex flex-col sm:flex-row justify-center space-y-4 sm:space-y-0 sm:space-x-6">
+                        <button onclick="showPage('find')" class="px-8 py-3 bg-emerald-600 text-white text-lg font-bold rounded-lg shadow-xl hover:bg-emerald-700 transition transform hover:scale-[1.02]">
+                            FIND A CHARGER
+                        </button>
+                        <button onclick="showPage('share')" class="px-8 py-3 border-2 border-emerald-600 text-emerald-600 text-lg font-bold rounded-lg hover:bg-emerald-600 hover:text-white transition transform hover:scale-[1.02]">
+                            SHARE YOUR CHARGER
+                        </button>
+                    </div>
+                </div>
+
+                <!-- How It Works (Three-Step Process) (Content unchanged) -->
+                <div class="py-12">
+                    <h2 class="text-4xl font-bold text-center mb-16">How It Works</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                        <!-- Step 1: FIND -->
+                        <div class="text-center p-6 bg-gray-50 rounded-xl shadow-lg hover:shadow-xl transition duration-300">
+                            <span class="text-5xl text-emerald-600 mb-4 inline-block">📍</span>
+                            <h3 class="text-2xl font-semibold mb-2">1. FIND</h3>
+                            <p class="text-gray-600">Use our interactive map to locate available private chargers near you, or search by location.</p>
+                        </div>
+                        <!-- Step 2: CONNECT -->
+                        <div class="text-center p-6 bg-gray-50 rounded-xl shadow-lg hover:shadow-xl transition duration-300">
+                            <span class="text-5xl text-emerald-600 mb-4 inline-block">🔗</span>
+                            <h3 class="text-2xl font-semibold mb-2">2. CONNECT</h3>
+                            <p class="text-gray-600">Securely book and pay for your charging session directly through the platform.</p>
+                        </div>
+                        <!-- Step 3: CHARGE -->
+                        <div class="text-center p-6 bg-gray-50 rounded-xl shadow-lg hover:shadow-xl transition duration-300">
+                            <span class="text-5xl text-emerald-600 mb-4 inline-block">🔋</span>
+                            <h3 class="text-2xl font-semibold mb-2">3. CHARGE</h3>
+                            <p class="text-gray-600">Arrive, plug in, and power up, knowing you're supporting community growth.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Benefits Section (Content unchanged) -->
+                <div class="py-12 mt-10">
+                    <h2 class="text-4xl font-bold text-center mb-16">Why Charge Link?</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-10">
+                        <!-- Card 1 -->
+                        <div class="text-center p-8 bg-white rounded-xl border border-gray-100 shadow-md">
+                            <span class="text-3xl text-blue-600 mb-4 inline-block">🌍</span>
+                            <h3 class="text-xl font-semibold mb-2">Accessible Everywhere</h3>
+                            <p class="text-gray-600">Access charging in residential and remote areas where public stations don't exist.</p>
+                        </div>
+                        <!-- Card 2 -->
+                        <div class="text-center p-8 bg-white rounded-xl border border-gray-100 shadow-md">
+                            <span class="text-3xl text-emerald-600 mb-4 inline-block">💰</span>
+                            <h3 class="text-xl font-semibold mb-2">Affordable & Fair</h3>
+                            <p class="text-gray-600">Competitive, community-set hourly rates save you money on every charge.</p>
+                        </div>
+                        <!-- Card 3 -->
+                        <div class="text-center p-8 bg-white rounded-xl border border-gray-100 shadow-md">
+                            <span class="text-3xl text-blue-600 mb-4 inline-block">🤝</span>
+                            <h3 class="text-xl font-semibold mb-2">Community Driven</h3>
+                            <p class="text-gray-600">Join a network of sustainable drivers and hosts dedicated to an electric future.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- FIND A CHARGER PAGE -->
+            <section id="find-page" class="page-transition hidden p-4 md:p-10 lg:p-16">
+                <!-- Added back button wrapper -->
+                <div class="flex items-center mb-8">
+                    <button onclick="showPage('home')" class="text-gray-500 hover:text-emerald-600 transition mr-4 p-1 rounded-full hover:bg-gray-100">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-7 h-7">
+                            <path d="M19 12H5"></path>
+                            <path d="M12 19l-7-7 7-7"></path>
+                        </svg>
+                    </button>
+                    <h2 class="text-4xl font-bold">Find a Charger</h2>
+                </div>
+
+                <!-- Search and Filters (Content unchanged) -->
+                <div class="mb-8 p-6 bg-gray-50 rounded-xl shadow-lg">
+                    <div class="flex flex-col md:flex-row gap-4 items-center mb-6">
+                        <input type="text" placeholder="Search by City, Address, or Host ID..." class="flex-grow px-5 py-3 border border-gray-300 rounded-lg focus:ring-emerald-600 focus:border-emerald-600 transition">
+                        <button class="px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition flex items-center justify-center">
+                            <span class="mr-2">📍</span> Use Current Location
+                        </button>
+                    </div>
+
+                    <!-- Filter Bar -->
+                    <div class="flex flex-wrap gap-3 text-sm text-gray-700">
+                        <span class="font-medium mr-2">Filters:</span>
+                        <div class="bg-white px-3 py-1.5 rounded-full border border-gray-300 cursor-pointer hover:bg-gray-100">Plug Type (CCS)</div>
+                        <div class="bg-white px-3 py-1.5 rounded-full border border-gray-300 cursor-pointer hover:bg-gray-100">Distance (< 5 mi)</div>
+                        <div class="bg-white px-3 py-1.5 rounded-full border border-gray-300 cursor-pointer hover:bg-gray-100">Rate (< ₹150/hr)</div>
+                        <button class="px-3 py-1.5 bg-emerald-600 text-white font-medium rounded-full hover:bg-emerald-700 transition">Available Now</button>
+                    </div>
+                </div>
+
+                <!-- Map and List View -->
+                <div class="flex flex-col lg:flex-row gap-8">
+                    <!-- Map Area (60%) - FIX: Retained visual placeholder (no error) -->
+                    <div class="lg:w-3/5 h-80 lg:h-[700px] bg-gray-200 rounded-xl shadow-inner border border-gray-300 flex items-center justify-center relative overflow-hidden">
+                        <!-- Simple placeholder pattern for visual appeal -->
+                        <div class="absolute inset-0 opacity-20" style="background-image: linear-gradient(45deg, #10b981 25%, transparent 25%), linear-gradient(-45deg, #10b981 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #10b981 75%), linear-gradient(-45deg, transparent 75%, #10b981 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px;"></div>
+                        <div class="z-10 text-center p-8 bg-white/90 rounded-xl shadow-lg">
+                            <span class="text-4xl">🗺️</span>
+                            <p class="mt-2 text-xl font-semibold text-gray-700">Interactive Map Placeholder</p>
+                            <p class="text-sm text-gray-500">A map API would render here to show charger locations.</p>
+                        </div>
+                    </div>
+                    
+                    <!-- Charger List (40%) - NOW DYNAMIC -->
+                    <div id="charger-list" class="lg:w-2/5 space-y-6 overflow-y-auto max-h-[700px] lg:max-h-[700px] pb-4">
+                        <!-- Charger cards will be dynamically inserted here by JavaScript -->
+                        <p class="text-center text-gray-500 p-8 bg-gray-50 rounded-xl">Loading available chargers...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- SHARE YOUR CHARGER PAGE (HOST) -->
+            <section id="share-page" class="page-transition hidden p-4 md:p-10 lg:p-16">
+                <!-- Added back button wrapper -->
+                <div class="flex items-center mb-2">
+                    <button onclick="showPage('home')" class="text-gray-500 hover:text-emerald-600 transition mr-4 p-1 rounded-full hover:bg-gray-100">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-7 h-7">
+                            <path d="M19 12H5"></path>
+                            <path d="M12 19l-7-7 7-7"></path>
+                        </svg>
+                    </button>
+                    <h2 class="text-4xl font-bold">Share Your Charger</h2>
+                </div>
+                
+                <p class="text-xl text-gray-600 mb-12">Earn passive income and help power the electric future.</p>
+
+                <div class="flex flex-col lg:flex-row gap-12">
+                    <!-- Listing Form (60%) -->
+                    <form id="charger-form" onsubmit="event.preventDefault(); submitCharger();" class="lg:w-3/5 p-8 bg-gray-50 rounded-xl shadow-lg">
+                        <h3 class="text-2xl font-semibold mb-6 text-emerald-600">Create Your Listing</h3>
+                        
+                        <!-- Form Section 1: Location & Logistics -->
+                        <div class="space-y-4 mb-8">
+                            <label class="block text-lg font-medium">Location & Charger Details</label>
+                            <input type="text" id="charger-address" placeholder="Full Address (e.g., 456 Elm Street)" class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white" required>
+                            
+                            <select id="charger-type" class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white appearance-none" required>
+                                <option>Select Charger Type</option>
+                                <option value="CCS">CCS</option>
+                                <option value="Type 2">Type 2</option>
+                                <option value="CHAdeMO">CHAdeMO</option>
+                            </select>
+
+                            <input type="number" id="charger-power" placeholder="Power Rating (kW) - e.g., 7" class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white" step="0.1" required>
+
+                            <textarea id="charger-instructions" placeholder="Access Instructions (e.g., 'Driveway on the left, near the blue recycling bin.')" rows="3" class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white"></textarea>
+                        </div>
+
+                        <!-- Form Section 2: Pricing & Availability -->
+                        <div class="space-y-4 mb-8">
+                            <label class="block text-lg font-medium">Pricing & Schedule</label>
+                            <div class="flex items-center space-x-2">
+                                <span class="text-2xl font-bold">₹</span>
+                                <input type="number" id="charger-price" placeholder="100" value="100" step="1" class="w-32 px-4 py-3 border border-gray-300 rounded-lg text-2xl font-bold focus:ring-emerald-600 focus:border-emerald-600 transition" required>
+                                <span class="text-lg">/ hour (Rs)</span>
+                            </div>
+                            <p class="text-sm text-gray-500 italic">10% platform commission is automatically factored into your net payout.</p>
+                            
+                            <!-- Availability Mock -->
+                            <div class="pt-4 space-y-2">
+                                <p class="font-medium">Available Hours:</p>
+                                <div class="flex flex-wrap gap-2">
+                                    <span class="bg-emerald-600 text-white text-sm px-3 py-1 rounded-full">Mon - Fri (6 PM - 8 AM)</span>
+                                    <span class="bg-emerald-600 text-white text-sm px-3 py-1 rounded-full">Sat - Sun (All Day)</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="w-full py-3 bg-emerald-600 text-white text-lg font-bold rounded-lg shadow-md hover:bg-emerald-700 transition">
+                            LIST MY CHARGER
+                        </button>
+                    </form>
+
+                    <!-- Host Dashboard Preview (40%) - NOW DYNAMIC -->
+                    <div class="lg:w-2/5 space-y-6">
+                        <h3 class="text-2xl font-semibold mb-4 text-emerald-600">Host Dashboard Preview</h3>
+                        
+                        <!-- Metric Card 1: Earnings -->
+                        <div class="p-6 bg-white rounded-xl shadow-lg border-t-4 border-emerald-600">
+                            <p class="text-sm text-gray-500">Total Earnings (This Month)</p>
+                            <p id="host-earnings" class="text-4xl font-extrabold text-emerald-600 mt-1">Loading...</p>
+                        </div>
+                        
+                        <!-- Metric Card 2: Bookings -->
+                        <div class="p-6 bg-white rounded-xl shadow-lg border-t-4 border-blue-600">
+                            <p class="text-sm text-gray-500">Upcoming Bookings</p>
+                            <p id="host-bookings" class="text-4xl font-extrabold text-blue-600 mt-1">Loading...</p>
+                        </div>
+                        
+                        <!-- Metric Card 3: Rating -->
+                        <div class="p-6 bg-white rounded-xl shadow-lg border-t-4 border-emerald-600">
+                            <p class="text-sm text-gray-500">Average Rating</p>
+                            <p id="host-rating" class="text-4xl font-extrabold text-emerald-600 mt-1">Loading...</p>
+                        </div>
+
+                        <div class="mt-8 p-6 bg-gray-50 rounded-xl">
+                            <p class="font-semibold text-lg mb-2">How You Earn</p>
+                            <ul class="text-gray-600 list-inside list-disc space-y-1">
+                                <li>You set the price and availability.</li>
+                                <li>We handle secure payment and transactions.</li>
+                                <li>Funds are deposited into your account weekly.</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+            </section>
+        </div>
+    </main>
+
+    <!-- 3. Footer -->
+    <footer class="bg-gray-800 text-white mt-16">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-8">
+                <!-- Brand Info -->
+                <div>
+                    <h4 class="text-xl font-bold mb-4 text-emerald-600">Charge Link</h4>
+                    <p class="text-sm text-gray-400">Powering the future of community-driven EV charging.</p>
+                </div>
+                <!-- Links -->
+                <div>
+                    <h4 class="font-semibold mb-4">Company</h4>
+                    <ul class="space-y-2 text-sm text-gray-400">
+                        <li><a href="#" class="hover:text-emerald-600 transition">About Us</a></li>
+                        <li><a href="#" class="hover:text-emerald-600 transition">Careers</a></li>
+                        <li><a href="#" class="hover:text-emerald-600 transition">FAQ</a></li>
+                    </ul>
+                </div>
+                <!-- Support -->
+                <div>
+                    <h4 class="font-semibold mb-4">Support</h4>
+                    <ul class="space-y-2 text-sm text-gray-400">
+                        <li><a href="#" class="hover:text-emerald-600 transition">Contact</a></li>
+                        <li><a href="#" class="hover:text-emerald-600 transition">Terms of Service</a></li>
+                        <li><a href="#" class="hover:text-emerald-600 transition">Privacy Policy</a></li>
+                    </ul>
+                </div>
+                <!-- Social -->
+                <div>
+                    <h4 class="font-semibold mb-4">Connect</h4>
+                    <div class="flex space-x-4 text-2xl">
+                        <span class="hover:text-emerald-600 transition cursor-pointer">X</span>
+                        <span class="hover:text-emerald-600 transition cursor-pointer">in</span>
+                        <span class="hover:text-emerald-600 transition cursor-pointer">f</span>
+                    </div>
+                </div>
+            </div>
+            <div class="mt-10 pt-6 border-t border-gray-700 text-center text-sm text-gray-400">
+                &copy; 2025 Charge Link. All rights reserved.
+            </div>
+        </div>
+    </footer>
+
+
+    <script>
+        // --- JavaScript for Page Navigation and Modal (Combined with Firebase logic from module) ---
+
+        let currentPageId = 'home-page';
+
+        /**
+         * Shows the requested page and hides all others.
+         * @param {string} pageName - The base name of the page (e.g., 'home', 'find', 'share').
+         */
+        function showPage(pageName) {
+            const targetId = `${pageName}-page`;
+            if (targetId === currentPageId) return;
+
+            // 1. Hide current page with fade out
+            const currentPageElement = document.getElementById(currentPageId);
+            if (currentPageElement) {
+                currentPageElement.style.opacity = '0';
+                setTimeout(() => {
+                    currentPageElement.classList.add('hidden');
+                    
+                    // 2. Show new page with fade in
+                    const nextPageElement = document.getElementById(targetId);
+                    if (nextPageElement) {
+                        nextPageElement.classList.remove('hidden');
+                        requestAnimationFrame(() => {
+                            nextPageElement.style.opacity = '1';
+                        });
+                        currentPageId = targetId;
+                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                    }
+
+                    // 3. Load dynamic data if auth is ready and page requires it
+                    if (window.isAuthReady) {
+                        if (pageName === 'find') {
+                            window.loadChargerListings();
+                        } else if (pageName === 'share') {
+                            window.loadHostDashboard();
+                        }
+                    }
+
+                }, 300); // Wait for fade out transition duration
+            }
+        }
+
+        // Initialize the first page appearance
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('home-page').style.opacity = '1';
+        });
+
+
+        // --- Custom Modal Functions (Instead of alert/confirm) ---
+
+        const modalContainer = document.getElementById('modal-container');
+        const modalBox = document.getElementById('modal-box');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+
+        /**
+         * Displays a custom modal message.
+         * @param {string} title - The title of the modal.
+         * @param {string} message - The message content.
+         */
+        function showModal(title, message) {
+            modalTitle.textContent = title;
+            modalMessage.textContent = message;
+            modalContainer.classList.remove('hidden');
+            modalContainer.classList.add('flex');
+            
+            // Trigger transition effects
+            setTimeout(() => {
+                modalBox.classList.remove('scale-95', 'opacity-0');
+                modalBox.classList.add('scale-100', 'opacity-100');
+            }, 10);
+        }
+
+        /** Hides the custom modal. */
+        function closeModal() {
+            modalBox.classList.remove('scale-100', 'opacity-100');
+            modalBox.classList.add('scale-95', 'opacity-0');
+            
+            // Hide container after transition
+            setTimeout(() => {
+                modalContainer.classList.add('hidden');
+                modalContainer.classList.remove('flex');
+            }, 300);
+        }
+
+        /** Placeholder for the "Book Now" button on the Find page (Actual transaction logic would go here). */
+        function mockBook(hostId) {
+            showModal(
+                "Booking Simulation", 
+                `Initiating secure booking for charger hosted by user ${hostId.substring(0, 8)}.... Actual transaction and payment logic would be implemented here in a fully functional site.`
+            );
+        }
+
+    </script>
+</body>
+</html>
